@@ -45,7 +45,7 @@ class Video:
             lambda: self.window.controller.camera.toggle_auto(self.window.ui.menu['video.capture.auto'].isChecked())
         )
 
-        self.window.ui.menu['menu.video'] = self.window.menuBar().addMenu(trans("menu.video"))
+        self.window.ui.menu['menu.video'] = self.window.menuBar().addMenu(trans("menu.video"))  
         self.window.ui.menu['menu.video'].addAction(self.window.ui.menu['video.capture'])
         self.window.ui.menu['menu.video'].addAction(self.window.ui.menu['video.capture.auto'])
         self.window.ui.menu['menu.video'].setToolTipsVisible(True)

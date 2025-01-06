@@ -35,7 +35,7 @@ class BridgeContext:
         self.thread_id = kwargs.get("thread_id", "")
         self.external_functions = kwargs.get("external_functions", [])
         self.tools_outputs = kwargs.get("tools_outputs", [])
-        self.max_tokens = kwargs.get("max_tokens", 150)
+        self.max_tokens = kwargs.get("max_tokens", 1500)
         self.idx = kwargs.get("idx", None)
         self.idx_mode = kwargs.get("idx_mode", "chat")
         self.attachments = kwargs.get("attachments", [])

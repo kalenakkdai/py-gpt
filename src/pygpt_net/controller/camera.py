@@ -15,14 +15,21 @@ import time
 from typing import Any
 
 import cv2
-
-from PySide6.QtCore import Slot, QObject
+import base64
+import tempfile
+import shutil
+from PySide6.QtCore import Slot, QObject, QTimer, QRunnable, Signal
 from PySide6.QtGui import QImage, QPixmap, Qt
+from PySide6.QtWidgets import QMessageBox
 
 from pygpt_net.core.events import AppEvent, KernelEvent
 from pygpt_net.core.camera import CaptureWorker
 from pygpt_net.utils import trans
-
+from openai import OpenAI
+from pygpt_net.item.ctx import CtxItem
+from pygpt_net.ui.dialog.result_dialog import ResultDialog  # Ensure this path is correct
+import wave
+import pyaudio
 
 class Camera(QObject):
     def __init__(self, window=None):
@@ -38,6 +45,9 @@ class Camera(QObject):
         self.is_capture = False
         self.stop = False
         self.auto = False
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        self.auto_capture_timer = QTimer(self)
+        self.result_dialog = ResultDialog(self.window)  # Initialize the dialog
 
     def setup(self):
         """Setup camera"""
@@ -258,7 +268,6 @@ class Camera(QObject):
             ]
             frame = self.get_current_frame()
             cv2.imwrite(path, frame, compression_params)
-
             # stop capture if not enabled before
             if not before_enabled:
                 self.disable_capture_internal()
@@ -377,7 +386,12 @@ class Camera(QObject):
         if not self.window.core.config.get('vision.capture.enabled'):
             self.enable_capture()
             self.window.ui.menu['video.capture'].setChecked(True)
-            # self.window.ui.nodes['vision.capture.enable'].setChecked(True)
+
+        # Start the timer to capture and send every 10 seconds
+        interval = 10000  # 5,000 ms = 5 seconds
+        duration = 5
+        self.auto_capture_timer.timeout.connect(lambda: self.capture_and_send(duration))
+        self.auto_capture_timer.start(interval)
 
     def disable_auto(self):
         """Disable capture"""
@@ -395,6 +409,9 @@ class Camera(QObject):
         )
         """
         self.window.ui.nodes['video.preview'].label.setText(trans("vision.capture.label"))
+
+        # Stop the timer
+        self.auto_capture_timer.stop()
 
     def toggle_auto(self, state: bool):
         """
@@ -510,4 +527,305 @@ class Camera(QObject):
         if self.window.controller.ui.vision.has_vision():
             return True
         return False
+
+    def capture_from_video(
+        self,
+        video_path: str,
+        frame_number: int = 0
+    ) -> str:
+        """
+        Capture frame from video file
+
+        :param video_path: path to video file
+        :param frame_number: frame number to capture (default: 0 for first frame)
+        :return: path to saved frame
+        """
+        try:
+            # Open the video file
+            cap = cv2.VideoCapture(video_path)
+            
+            # Set frame position
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            
+            # Read the frame
+            ret, frame = cap.read()
+            
+            if not ret:
+                print("Failed to capture frame")
+                return ""
+            
+            # Prepare filename
+            now = datetime.datetime.now()
+            dt = now.strftime("%Y-%m-%d_%H-%M-%S")
+            name = 'video-cap-' + dt
+            path = os.path.join(
+                self.window.core.config.get_user_dir('capture'),
+                name + '.jpg'
+            )
+            
+            # Save the frame
+            compression_params = [
+                cv2.IMWRITE_JPEG_QUALITY,
+                int(self.window.core.config.get('vision.capture.quality'))
+            ]
+            cv2.imwrite(path, frame, compression_params)
+            
+            # Release the video capture
+            cap.release()
+            
+            return path
+            
+        except Exception as e:
+            print("Video frame capture exception", e)
+            self.window.core.debug.log(e)
+            return ""
+
+    def capture_frames_and_transcription(self, video_path: str, duration: int = 30, max_frames: int = 3) -> list:
+        """
+        Capture frames from video segments, save them, and return a list of transcriptions with frames.
+
+        :param video_path: path to video file
+        :param duration: duration of each video segment to capture in seconds
+        :param max_frames: maximum number of frames to capture per segment
+        :return: list of tuples (list of base64 encoded frames, transcription text) for each segment
+        """
+        try:
+            # Open the video file
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            segment_frames = int(fps * duration)  # Frames per segment
+
+            results = []
+
+            # Get the parent directory of the video_path
+            parent_dir = os.path.dirname(video_path)
+            
+            # Extract the video file name without the extension
+            video_file_name = os.path.splitext(os.path.basename(video_path))[0]
+            
+            # Define the base directory for analysis using the parent directory
+            analysis_base_dir = os.path.join(parent_dir, '..', 'analysis')
+            
+            # Create directories for saving frames and segments
+            frames_dir = os.path.join(analysis_base_dir, video_file_name, 'frames')
+            segments_dir = os.path.join(analysis_base_dir, video_file_name, 'segments')
+            os.makedirs(frames_dir, exist_ok=True)
+            os.makedirs(segments_dir, exist_ok=True)
+
+            segment_index = 0
+            while cap.isOpened():
+                # Set the start frame for the current segment
+                cap.set(cv2.CAP_PROP_POS_FRAMES, segment_index * segment_frames)
+
+                # Initialize storage for encoded frames
+                base64_frames = []
+                frame_count = 0
+                captured_frames = 0
+
+                while frame_count < segment_frames and captured_frames < max_frames:
+                    success, frame = cap.read()
+                    if not success:
+                        break
+
+                    if frame_count % (segment_frames // max_frames) == 0:
+                        # Save frame as image
+                        frame_filename = os.path.join(frames_dir, f"segment_{segment_index}_frame_{captured_frames}.jpg")
+                        cv2.imwrite(frame_filename, frame)
+
+                        # Encode frame to base64
+                        _, buffer = cv2.imencode(".jpg", frame)
+                        base64_frames.append(base64.b64encode(buffer).decode("utf-8"))
+
+                        captured_frames += 1
+
+                    frame_count += 1
+
+                if not base64_frames:
+                    break
+
+                # Extract audio segment for transcription
+                audio_filename = os.path.join(segments_dir, f"segment_{segment_index}_audio.wav")
+                os.system(f"ffmpeg -i {video_path} -ss {segment_index * duration} -t {duration} -q:a 0 -map a {audio_filename} -y -loglevel quiet")
+
+                try:
+                    # Use OpenAI client for transcription
+                    with open(audio_filename, "rb") as audio_file:
+                        transcription = self.client.audio.transcriptions.create(
+                            model="whisper-1",
+                                file=audio_file,
+                                response_format="text"
+                        )
+                        results.append((base64_frames, transcription))
+
+                        segment_index += 1
+                except Exception as e:
+                    print(f"Error in transcription: {e}")
+                    transcription = ""
+                    break
+            # Release the video capture
+            cap.release()
+
+            return results
+
+        except Exception as e:
+            print("Video frame capture and transcription exception", e)
+            raise e
+
+    def capture_and_send(self, interval=2):
+        """Capture an image and send it for analysis in a separate thread"""
+        # Show loading indicator
+        event = KernelEvent(KernelEvent.STATUS, {
+            'status': 'Capturing and analyzing...',
+        })
+        self.window.dispatch(event)
+        
+        worker = CaptureAndSendWorker(self, interval)
+        worker.signals.finished.connect(self.show_analysis_result)
+        worker.signals.error.connect(self.handle_capture_error)
+        self.window.threadpool.start(worker)
+
+    def handle_capture_error(self, error_msg):
+        """Handle errors from the capture worker"""
+        print(f"Capture and analysis error: {error_msg}")
+        # Optionally show error in UI
+        event = KernelEvent(KernelEvent.STATE_ERROR, {
+            'msg': f"Capture error: {error_msg}",
+        })
+        self.window.dispatch(event)
+
+    def show_analysis_result(self, result: str, image_path: str):
+        """Show analysis result in the dialog with image"""
+        self.result_dialog.add_result(result, image_path)
+        if not self.result_dialog.isVisible():
+            self.result_dialog.show()
+
+    def capture_audio(self, duration=10, filename="audio_capture.wav"):
+        """Capture audio from the microphone"""
+        chunk = 1024  # Record in chunks of 1024 samples
+        sample_format = pyaudio.paInt16  # 16 bits per sample
+        channels = 1
+        fs = 44100  # Record at 44100 samples per second
+        p = pyaudio.PyAudio()
+
+        print("Recording audio...")
+        stream = p.open(format=sample_format,
+                        channels=channels,
+                        rate=fs,
+                        frames_per_buffer=chunk,
+                        input=True)
+
+        frames = []  # Initialize array to store frames
+
+        # Store data in chunks for the specified duration
+        for _ in range(0, int(fs / chunk * duration)):
+            data = stream.read(chunk)
+            frames.append(data)
+
+        # Stop and close the stream
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+
+        # Save the recorded data as a WAV file
+        wf = wave.open(filename, 'wb')
+        wf.setnchannels(channels)
+        wf.setsampwidth(p.get_sample_size(sample_format))
+        wf.setframerate(fs)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+
+        print("Audio recording complete.")
+        return filename
+
+    def transcribe_audio(self, audio_path):
+        """Transcribe audio using OpenAI's Whisper model"""
+        try:
+            with open(audio_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
+                return transcription
+        except Exception as e:
+            print(f"Error in transcription: {e}")
+            return ""
+
+class CaptureWorkerSignals(QObject):
+    finished = Signal(str, str)  # Signals for result and image_path
+    error = Signal(str)
+
+class CaptureAndSendWorker(QRunnable):
+    def __init__(self, camera, interval):
+        super().__init__()
+        self.camera = camera
+        self.interval = interval
+        self.signals = CaptureWorkerSignals()
+
+    def run(self):
+        try:
+            # Capture frame
+            path = self.camera.capture_frame_save()
+            if not path:
+                self.signals.error.emit("Failed to capture frame")
+                return
+
+            # Capture audio
+            audio_path = self.camera.capture_audio(self.interval)
+            
+            # Transcribe audio
+            transcription = self.camera.transcribe_audio(audio_path)
+            
+            if transcription:
+                from pygpt_net.core.vision.analyzer import Analyzer
+                ctx = CtxItem()
+                prompt = f"""
+                You are an AI assistant tasked with analyzing classroom sentiment. 
+                Based on the combination of visual cues (e.g., facial expressions, body language) and conversational context (e.g., tone, participation), 
+                detect the overall classroom sentiment and provide reasoning for your analysis.
+
+                Instructions:
+                1. Analyze sentiment based on descriptive inputs of what students look like and say
+                2. Identify emotions such as engagement, confusion, boredom, or frustration
+                3. Provide a clear and concise explanation of how the visual and conversational data lead to the detected sentiment
+                4. Return your analysis in the following JSON format:
+
+                {{
+                    "sentiment_score": float,  // Score from -5.0 (most negative) to 5.0 (most positive)
+                    "sentiment_label": string, // Brief label describing the sentiment (e.g., "highly engaged", "moderately bored")
+                    "reasoning": string,       // Brief explanation of your analysis
+                    "transcript_cues": "{transcription}",  // Transcript cues
+                    "visual_cues": [          // List of observed visual indicators
+                        string,
+                        ...
+                    ],
+                    "recommendations": [      // List of suggested improvements
+                        string,
+                        ...
+                    ]
+                }}
+
+                Note: sentiment_score must be between -5.0 and 5.0, where:
+                * 5.0: Extremely engaged and enthusiastic
+                * 3.0: Actively engaged
+                * 1.0: Slightly engaged
+                * 0.0: Neutral
+                * -1.0: Slightly disengaged
+                * -3.0: Notably disengaged
+                * -5.0: Completely disengaged or disruptive
+                """
+
+                analyzer = Analyzer(self.camera.window)
+                response = analyzer.from_camera(ctx, prompt)
+                
+                if "```json" in response:
+                    json_str = response.split("```json")[1].split("```")[0]
+                else:
+                    json_str = response
+                
+                # Emit the result
+                self.signals.finished.emit(json_str, path)
+            
+        except Exception as e:
+            self.signals.error.emit(str(e))
 

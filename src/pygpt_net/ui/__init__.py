@@ -134,12 +134,13 @@ class UI:
         suffix = self.window.core.platforms.get_env_suffix()
         profile_name = self.window.core.config.profile.get_current_name()
         self.window.setWindowTitle(
-            'PyGPT - Desktop AI Assistant {} | build {}{} ({})'.format(
-                self.window.meta['version'],
-                self.window.meta['build'].replace('.', '-'),
-                suffix,
-                profile_name,
-            )
+            'Parrot - Classroom AI Assistant'
+            # 'PyGPT - Desktop AI Assistant {} | build {}{} ({})'.format(
+            #     self.window.meta['version'],
+            #     self.window.meta['build'].replace('.', '-'),
+            #     suffix,
+            #     profile_name,
+            # )
         )
 
     def post_setup(self):
